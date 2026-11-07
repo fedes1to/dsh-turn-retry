@@ -1,0 +1,10 @@
+# dsh-turn-retry bundle patch: mount the plugin as a profile row.
+#
+# Override by id in the profile's own cordis.patch.yml user layer — do NOT
+# insert a second same-id row. Omitting every key uses the plugin defaults
+# (maxRetries: 10, delayMs: 1000, exponential backoff, source kind
+# `turn-retry`).
+- insert:
+    - id: turn-retry
+      name: 'dsh-turn-retry'
+      config: {}
