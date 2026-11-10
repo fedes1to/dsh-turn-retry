@@ -13,9 +13,25 @@
  * reaches the model without adding a human bubble.
  *
  * The retry budget is per session and resets as soon as the session completes
- * a turn or a person sends a fresh prompt. Subagent sessions are skipped by
- * default: their parent already received the failure, so restarting them in
- * the background would be orphan work.
+ * a turn or a person sends a fresh prompt.
+ *
+ * Delegated children (subagent / subagent_fork / Agent Teams teammates) are
+ * retried too, and immediately rather than after the delay: a child settles and
+ * is disposed as soon as it goes idle, so a delayed retry would find no live
+ * agent and the delegation would be lost. Delivering while the failed turn is
+ * still closing keeps the child resident, and the parent observes the eventual
+ * outcome instead of an intermediate failure. Set `includeSubagents: false` to
+ * keep the old skip-the-child behaviour.
+ *
+ * A compaction is not a turn: the host brackets it with `compaction/start` and
+ * `compaction/end`, and a failed close records `error` on the end event. A
+ * turn-owned compaction failure is already covered by the turn retry (the turn
+ * either continues, because the host catches pressure-compaction failures, or
+ * ends with an error and is restarted), so only a standalone (manual)
+ * compaction is retried here — by re-running the compaction through the
+ * compaction service, not by injecting a model turn. A model turn would not
+ * compact a session that sits below the automatic threshold, and it would
+ * claim a failed turn that never existed.
  *
  * @module dsh-turn-retry
  */
@@ -45,6 +61,9 @@ export const DEFAULT_SOURCE_KIND = 'turn-retry'
 /** What the model is told when a turn is restarted. */
 export const DEFAULT_RETRY_TEXT =
   'The previous turn ended with an error before it could finish. Resume the same task from where it stopped; do not repeat work that already completed, and do not ask for confirmation.'
+
+/** A compaction close that records a cancellation rather than a failure. */
+const CANCELLATION = /abort|cancel/i
 
 /**
  * Coerce a config value to a finite number at or above `minimum`.
@@ -82,6 +101,15 @@ const asText = (value, fallback) =>
   typeof value === 'string' && value.trim() !== '' ? value : fallback
 
 /**
+ * Whether a session is a delegated child (spawn subagent, fork child, or an
+ * Agent Teams teammate) rather than a top-level conversation.
+ * @param {{ header?: { origin?: string, parentSession?: string } }} session - the session.
+ * @returns {boolean} whether the session was delegated by another agent.
+ */
+const isDelegatedChild = (session) =>
+  session?.header?.origin === 'subagent' || session?.header?.parentSession !== undefined
+
+/**
  * Wire the plugin.
  *
  * @param {import('@deepseek-ai/cordis').Context} ctx - Cordis context.
@@ -93,6 +121,7 @@ const asText = (value, fallback) =>
  *   retryText?: string,
  *   sourceKind?: string,
  *   includeSubagents?: boolean,
+ *   includeCompaction?: boolean,
  *   notices?: boolean,
  *   retryOnCodes?: string[],
  * }} [config] - Row config.
@@ -104,9 +133,9 @@ export function apply(ctx, config = {}) {
   const backoff = Math.max(1, asNumber(config.backoff, DEFAULT_BACKOFF, 1))
   const retryText = asText(config.retryText, DEFAULT_RETRY_TEXT)
   const sourceKind = asText(config.sourceKind, DEFAULT_SOURCE_KIND)
-  const includeSubagents = config.includeSubagents === true
-  // Compaction retry is ON by default: a compaction that fails leaves the
-  // context over its threshold, and the session then cannot make progress.
+  // Retry delegated children by default: skipping a failed subagent loses the
+  // delegation, because the parent receives no result and cannot resume it.
+  const includeSubagents = config.includeSubagents !== false
   const includeCompaction = config.includeCompaction !== false
   const notices = config.notices !== false
   const retryOnCodes =
@@ -263,6 +292,17 @@ export function apply(ctx, config = {}) {
     state.failure = failure
     const attempt = state.attempts
     const generation = state.generation
+
+    if (isDelegatedChild(session)) {
+      // A delegated child settles and is disposed as soon as it goes idle, so a
+      // delayed retry would find no live agent. Deliver while the failed turn
+      // is still closing: `deliver` waits for the driver to go idle and queues
+      // the follow-up before the settlement watcher can close the child.
+      notify(`↻ turn failed — retry ${attempt}/${maxRetries}`, 'warning')
+      deliver(id, generation)
+      return
+    }
+
     const delay = Math.min(maxDelayMs, Math.round(baseDelayMs * Math.pow(backoff, attempt - 1)))
 
     state.timer = setTimeout(() => {
@@ -276,44 +316,141 @@ export function apply(ctx, config = {}) {
   }
 
   // ── compaction retries ────────────────────────────────────────────────────
-  // A COMPACTION IS NOT A TURN, so the `turn/end` watcher below never fires for
-  // it. The host brackets every compaction with `compaction/start` and
-  // `compaction/end`, and that bracket carries NO outcome — `translate.js`
-  // hardcodes `ok: true`. What distinguishes success is the checkpoint message:
-  // a successful compaction appends a `user/message` whose source kind is
-  // `compact-checkpoint`, and a failed one appends nothing. So the test is
-  // "did a checkpoint land inside the bracket".
+  // A COMPACTION IS NOT A TURN, so the `turn/end` watcher never fires for it.
+  // The host brackets every compaction with `compaction/start` and
+  // `compaction/end`, and a failed close records `error` on the end event.
   //
-  // The retry is the same followup the turn path uses, and it works for the same
-  // reason: the context is still over the threshold, so the next turn triggers
-  // auto-compaction again. It carries its OWN budget, because a followup that
-  // completes a turn would otherwise reset the turn budget and let a
-  // permanently-failing summarizer loop forever.
-  const compactOpen = new Set()
-  const compactSawCheckpoint = new Set()
+  // Only a STANDALONE (manual) compaction is retried here. A turn-owned
+  // compaction failure is already covered by the turn path: a pressure
+  // compaction failure is caught by the host and the turn continues, and an
+  // overflow-recovery failure ends the turn with an error, which the turn retry
+  // restarts. Injecting a follow-up for those would duplicate the retry or
+  // invent a turn that never failed. The retry therefore re-runs the
+  // compaction itself, which also works for a manual compaction below the
+  // automatic threshold.
+  //
+  // The compaction path carries its OWN budget: a follow-up that completes a
+  // turn must not reset it, or a permanently-failing summarizer would loop
+  // forever. A committed compaction and a fresh human prompt do reset it.
   const compactAttempts = new Map()
+  const compactTimers = new Map()
+  const compactControllers = new Map()
+  const compactRetrying = new Set()
 
-  const scheduleCompaction = (session) => {
-    const id = session.id
-    const attempt = (compactAttempts.get(id) ?? 0) + 1
+  /**
+   * Drop a pending compaction retry and abort one in flight.
+   * @param {string} id - session id.
+   */
+  const stopCompaction = (id) => {
+    const timer = compactTimers.get(id)
+    if (timer !== undefined) {
+      clearTimeout(timer)
+      compactTimers.delete(id)
+    }
+    const controller = compactControllers.get(id)
+    if (controller !== undefined) {
+      controller.abort()
+      compactControllers.delete(id)
+    }
+  }
+
+  /**
+   * Drop a pending compaction retry and reset its budget.
+   * @param {string} id - session id.
+   */
+  const resetCompaction = (id) => {
+    stopCompaction(id)
+    compactAttempts.delete(id)
+    compactRetrying.delete(id)
+  }
+
+  /**
+   * Re-run one failed standalone compaction through the compaction service.
+   * @param {string} id - session id.
+   * @param {boolean} delegated - whether the session is a delegated child.
+   * @param {number} attempt - the attempt number this run represents.
+   */
+  const runCompactionRetry = (id, delegated, attempt) => {
+    compactTimers.delete(id)
+    const agent = ctx.agents?.get(id)
+    const engine = typeof ctx.get === 'function' ? ctx.get('compaction') : undefined
+    if (agent === undefined || agent.status !== 'idle' || typeof engine?.compactNow !== 'function') {
+      compactAttempts.delete(id)
+      return
+    }
+
+    const controller = new AbortController()
+    compactControllers.set(id, controller)
+    compactRetrying.add(id)
+
+    const settle = (failed) => {
+      compactControllers.delete(id)
+      compactRetrying.delete(id)
+      if (controller.signal.aborted) return
+      if (!failed) {
+        // A committed (or unnecessary) compaction proves the summarizer works.
+        compactAttempts.delete(id)
+        return
+      }
+      if (compactAttempts.get(id) !== attempt) return
+      if (attempt >= maxRetries) {
+        compactAttempts.delete(id)
+        notify(
+          `↻ compaction retry: gave up after ${maxRetries} ${maxRetries === 1 ? 'retry' : 'retries'}`,
+          'error',
+        )
+        return
+      }
+      scheduleCompactionRetry(id, delegated, attempt + 1)
+    }
+
+    let pending
+    try {
+      pending = engine.compactNow(agent, controller.signal)
+    } catch (error) {
+      pending = Promise.reject(error)
+    }
+    Promise.resolve(pending).then(
+      () => settle(false),
+      (error) => {
+        if (!controller.signal.aborted) {
+          ctx.logger?.warn?.(`turn-retry: compaction retry on ${id} failed: ${String(error)}`)
+        }
+        settle(true)
+      },
+    )
+  }
+
+  /**
+   * Arm one retry for a standalone compaction that closed with an error.
+   * @param {string} id - session id.
+   * @param {boolean} delegated - whether the session is a delegated child.
+   * @param {number} attempt - attempt number to arm.
+   */
+  const scheduleCompactionRetry = (id, delegated, attempt) => {
+    if (!includeCompaction) return
+    if (!includeSubagents && delegated) return
     if (attempt > maxRetries) {
-      notify(`↻ compaction retry: gave up after ${maxRetries} ${maxRetries === 1 ? 'retry' : 'retries'}`, 'error')
+      compactAttempts.delete(id)
+      notify(
+        `↻ compaction retry: gave up after ${maxRetries} ${maxRetries === 1 ? 'retry' : 'retries'}`,
+        'error',
+      )
       return
     }
     const agent = ctx.agents?.get(id)
-    if (agent === undefined || typeof agent.followup !== 'function') return
+    if (agent === undefined) return
+
+    const previous = compactTimers.get(id)
+    if (previous !== undefined) clearTimeout(previous)
     compactAttempts.set(id, attempt)
     const delay = Math.min(maxDelayMs, Math.round(baseDelayMs * Math.pow(backoff, attempt - 1)))
     const timer = setTimeout(() => {
-      const live = ctx.agents?.get(id)
-      if (live === undefined || typeof live.followup !== 'function') return
-      try {
-        live.followup(buildMessage({ message: 'the context compaction failed' }))
-      } catch (error) {
-        ctx.logger?.warn?.(`turn-retry: could not restart compaction on ${id}: ${String(error)}`)
-      }
+      runCompactionRetry(id, delegated, attempt)
     }, delay)
+    compactTimers.set(id, timer)
     timer.unref?.()
+
     notify(`↻ compaction failed — retry ${attempt}/${maxRetries} in ${delay}ms`, 'warning')
   }
 
@@ -329,7 +466,7 @@ export function apply(ctx, config = {}) {
     if (event.type === 'turn/end') {
       const reason = event.data?.reason
       if (reason?.kind === 'error') {
-        if (!includeSubagents && session.header?.origin === 'subagent') return
+        if (!includeSubagents && isDelegatedChild(session)) return
         const code = reason.error?.code
         if (retryOnCodes !== undefined && !retryOnCodes.has(code)) return
         schedule(session, reason.error)
@@ -340,46 +477,50 @@ export function apply(ctx, config = {}) {
     }
 
     // ── compaction bracket ──────────────────────────────────────────────────
-    if (event.type === 'compaction/start') {
-      compactOpen.add(id)
-      compactSawCheckpoint.delete(id)
-      return
-    }
-    if (event.type === 'user/message' && event.data?.source?.kind === 'compact-checkpoint') {
-      if (compactOpen.has(id)) compactSawCheckpoint.add(id)
-      return
-    }
     if (event.type === 'compaction/end') {
-      const wasOpen = compactOpen.delete(id)
-      const ok = compactSawCheckpoint.delete(id)
-      // A bracket we did not see open is a resumed session's tail, not a
-      // compaction this process watched; and a checkpoint inside the bracket is
-      // a success. Only the remaining case is a failure to retry.
-      if (!wasOpen || ok || !includeCompaction) return
-      if (!includeSubagents && session.header?.origin === 'subagent') return
-      scheduleCompaction(session)
+      // Our own re-run's bracket is driven by the promise, not by this event.
+      if (compactRetrying.has(id)) return
+      const failed = typeof event.data?.error === 'string' && event.data.error !== ''
+      if (!failed) {
+        // A committed compaction proves the summarizer works again.
+        resetCompaction(id)
+        return
+      }
+      // A numbered owner means the compaction was enclosed in a turn: the turn
+      // path already covers it (the turn continues, or fails and restarts).
+      if (event.data?.turn !== null) return
+      // A cancellation is a person's decision, not a transient summarizer
+      // failure. The end event carries only the rendered error, so match it.
+      if (CANCELLATION.test(event.data.error)) return
+      scheduleCompactionRetry(id, isDelegatedChild(session), 1)
       return
     }
 
-    if (event.type === 'user/message' && event.data?.source?.kind === 'user') {
-      // A fresh human prompt supersedes a pending automatic retry, and it is the
-      // ONLY thing that resets the compaction budget: a successful turn must
-      // not, or a summarizer that always fails would retry forever.
-      forget(id)
-      compactAttempts.delete(id)
+    if (event.type === 'user/message') {
+      const kind = event.data?.source?.kind
+      if (kind === 'user' || kind === 'agent-message') {
+        // A fresh human (or peer) prompt supersedes a pending automatic retry,
+        // and it is the only thing that resets the compaction budget.
+        forget(id)
+        resetCompaction(id)
+      }
     }
   }
 
   ctx.on('session/event', onSessionEvent)
   ctx.on('session/disposed', (session) => {
     remove(session.id)
-    compactOpen.delete(session.id)
-    compactSawCheckpoint.delete(session.id)
-    compactAttempts.delete(session.id)
+    resetCompaction(session.id)
   })
-  ctx.on('agent/disposed', ({ agent }) => remove(agent.session.id))
+  ctx.on('agent/disposed', (payload) => {
+    const sessionId = payload?.agent?.session?.id
+    if (sessionId === undefined) return
+    remove(sessionId)
+    resetCompaction(sessionId)
+  })
 
   ctx.effect(() => () => {
     for (const id of [...sessions.keys()]) remove(id)
+    for (const id of [...compactAttempts.keys()]) resetCompaction(id)
   })
 }

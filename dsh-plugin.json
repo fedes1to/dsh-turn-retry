@@ -3,7 +3,7 @@
   "manifestVersion": "0.15",
   "id": "turn-retry.plugin",
   "name": "dsh-turn-retry",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "facets": {
     "host": {
       "entry": "./index.js",
