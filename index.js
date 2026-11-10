@@ -105,6 +105,9 @@ export function apply(ctx, config = {}) {
   const retryText = asText(config.retryText, DEFAULT_RETRY_TEXT)
   const sourceKind = asText(config.sourceKind, DEFAULT_SOURCE_KIND)
   const includeSubagents = config.includeSubagents === true
+  // Compaction retry is ON by default: a compaction that fails leaves the
+  // context over its threshold, and the session then cannot make progress.
+  const includeCompaction = config.includeCompaction !== false
   const notices = config.notices !== false
   const retryOnCodes =
     Array.isArray(config.retryOnCodes) && config.retryOnCodes.length > 0
@@ -272,6 +275,48 @@ export function apply(ctx, config = {}) {
     notify(`↻ turn failed — retry ${attempt}/${maxRetries} in ${delay}ms`, 'warning')
   }
 
+  // ── compaction retries ────────────────────────────────────────────────────
+  // A COMPACTION IS NOT A TURN, so the `turn/end` watcher below never fires for
+  // it. The host brackets every compaction with `compaction/start` and
+  // `compaction/end`, and that bracket carries NO outcome — `translate.js`
+  // hardcodes `ok: true`. What distinguishes success is the checkpoint message:
+  // a successful compaction appends a `user/message` whose source kind is
+  // `compact-checkpoint`, and a failed one appends nothing. So the test is
+  // "did a checkpoint land inside the bracket".
+  //
+  // The retry is the same followup the turn path uses, and it works for the same
+  // reason: the context is still over the threshold, so the next turn triggers
+  // auto-compaction again. It carries its OWN budget, because a followup that
+  // completes a turn would otherwise reset the turn budget and let a
+  // permanently-failing summarizer loop forever.
+  const compactOpen = new Set()
+  const compactSawCheckpoint = new Set()
+  const compactAttempts = new Map()
+
+  const scheduleCompaction = (session) => {
+    const id = session.id
+    const attempt = (compactAttempts.get(id) ?? 0) + 1
+    if (attempt > maxRetries) {
+      notify(`↻ compaction retry: gave up after ${maxRetries} ${maxRetries === 1 ? 'retry' : 'retries'}`, 'error')
+      return
+    }
+    const agent = ctx.agents?.get(id)
+    if (agent === undefined || typeof agent.followup !== 'function') return
+    compactAttempts.set(id, attempt)
+    const delay = Math.min(maxDelayMs, Math.round(baseDelayMs * Math.pow(backoff, attempt - 1)))
+    const timer = setTimeout(() => {
+      const live = ctx.agents?.get(id)
+      if (live === undefined || typeof live.followup !== 'function') return
+      try {
+        live.followup(buildMessage({ message: 'the context compaction failed' }))
+      } catch (error) {
+        ctx.logger?.warn?.(`turn-retry: could not restart compaction on ${id}: ${String(error)}`)
+      }
+    }, delay)
+    timer.unref?.()
+    notify(`↻ compaction failed — retry ${attempt}/${maxRetries} in ${delay}ms`, 'warning')
+  }
+
   /**
    * The session feed: turn closers arm or clear retries, human prompts reset.
    * @param {import('@deepseek-ai/dsh-session').Session} session - the session whose log grew.
@@ -294,14 +339,44 @@ export function apply(ctx, config = {}) {
       return
     }
 
+    // ── compaction bracket ──────────────────────────────────────────────────
+    if (event.type === 'compaction/start') {
+      compactOpen.add(id)
+      compactSawCheckpoint.delete(id)
+      return
+    }
+    if (event.type === 'user/message' && event.data?.source?.kind === 'compact-checkpoint') {
+      if (compactOpen.has(id)) compactSawCheckpoint.add(id)
+      return
+    }
+    if (event.type === 'compaction/end') {
+      const wasOpen = compactOpen.delete(id)
+      const ok = compactSawCheckpoint.delete(id)
+      // A bracket we did not see open is a resumed session's tail, not a
+      // compaction this process watched; and a checkpoint inside the bracket is
+      // a success. Only the remaining case is a failure to retry.
+      if (!wasOpen || ok || !includeCompaction) return
+      if (!includeSubagents && session.header?.origin === 'subagent') return
+      scheduleCompaction(session)
+      return
+    }
+
     if (event.type === 'user/message' && event.data?.source?.kind === 'user') {
-      // A fresh human prompt supersedes a pending automatic retry.
+      // A fresh human prompt supersedes a pending automatic retry, and it is the
+      // ONLY thing that resets the compaction budget: a successful turn must
+      // not, or a summarizer that always fails would retry forever.
       forget(id)
+      compactAttempts.delete(id)
     }
   }
 
   ctx.on('session/event', onSessionEvent)
-  ctx.on('session/disposed', (session) => remove(session.id))
+  ctx.on('session/disposed', (session) => {
+    remove(session.id)
+    compactOpen.delete(session.id)
+    compactSawCheckpoint.delete(session.id)
+    compactAttempts.delete(session.id)
+  })
   ctx.on('agent/disposed', ({ agent }) => remove(agent.session.id))
 
   ctx.effect(() => () => {

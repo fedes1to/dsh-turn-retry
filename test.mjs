@@ -246,4 +246,111 @@ assert.equal(DEFAULT_MAX_RETRIES, 10)
   assert.equal(toasts.length, 0)
 }
 
-console.log('ok — turn-retry restarts failed turns within the configured budget')
+// ── compaction ──────────────────────────────────────────────────────────────
+// A compaction is not a turn: the host brackets it with `compaction/start` and
+// `compaction/end`, the bracket carries no outcome, and success is signalled by
+// a `compact-checkpoint` user message landing inside it.
+const compactStart = { type: 'compaction/start' }
+const compactEnd = { type: 'compaction/end' }
+const checkpoint = {
+  type: 'user/message',
+  data: { source: { kind: 'compact-checkpoint', compactionId: 'c1' } },
+}
+
+// A compaction that closes with no checkpoint is restarted.
+{
+  const { emit, addAgent } = mount({ delayMs: 0, backoff: 1 })
+  const agent = addAgent('s1')
+  emit('session/event', session('s1'), compactStart)
+  emit('session/event', session('s1'), compactEnd)
+  assert.equal(agent.calls.length, 0, 'the retry is scheduled, not immediate')
+  await tick()
+  assert.equal(agent.calls.length, 1)
+  assert.equal(agent.calls[0].source.kind, DEFAULT_SOURCE_KIND)
+  assert.notEqual(agent.calls[0].source.kind, 'user')
+}
+
+// A compaction that committed a checkpoint is NOT restarted.
+{
+  const { emit, addAgent } = mount({ delayMs: 0, backoff: 1 })
+  const agent = addAgent('s1')
+  emit('session/event', session('s1'), compactStart)
+  emit('session/event', session('s1'), checkpoint)
+  emit('session/event', session('s1'), compactEnd)
+  await tick()
+  assert.equal(agent.calls.length, 0)
+}
+
+// A checkpoint that arrives OUTSIDE a bracket does not count as a success.
+{
+  const { emit, addAgent } = mount({ delayMs: 0, backoff: 1 })
+  const agent = addAgent('s1')
+  emit('session/event', session('s1'), checkpoint)
+  emit('session/event', session('s1'), compactStart)
+  emit('session/event', session('s1'), compactEnd)
+  await tick()
+  assert.equal(agent.calls.length, 1)
+}
+
+// A bracket whose start this process never saw is a resumed tail, not a failure.
+{
+  const { emit, addAgent } = mount({ delayMs: 0, backoff: 1 })
+  const agent = addAgent('s1')
+  emit('session/event', session('s1'), compactEnd)
+  await tick()
+  assert.equal(agent.calls.length, 0)
+}
+
+// `includeCompaction: false` disables it without touching the turn path.
+{
+  const { emit, addAgent } = mount({ delayMs: 0, backoff: 1, includeCompaction: false })
+  const agent = addAgent('s1')
+  emit('session/event', session('s1'), compactStart)
+  emit('session/event', session('s1'), compactEnd)
+  await tick()
+  assert.equal(agent.calls.length, 0)
+  emit('session/event', session('s1'), turnEnd('error', { code: 'SERVER', message: 'boom' }))
+  await tick()
+  assert.equal(agent.calls.length, 1, 'the turn path still retries')
+}
+
+// The compaction budget is separate: a completed turn does NOT reset it, or a
+// summarizer that always fails would retry forever.
+{
+  const { emit, addAgent } = mount({ delayMs: 0, backoff: 1, maxRetries: 2 })
+  const agent = addAgent('s1')
+  for (let index = 0; index < 4; index += 1) {
+    emit('session/event', session('s1'), compactStart)
+    emit('session/event', session('s1'), compactEnd)
+    emit('session/event', session('s1'), turnEnd('completed'))
+    await tick()
+  }
+  assert.equal(agent.calls.length, 2, 'capped at maxRetries despite the completed turns')
+}
+
+// A fresh human prompt resets the compaction budget.
+{
+  const { emit, addAgent } = mount({ delayMs: 0, backoff: 1, maxRetries: 1 })
+  const agent = addAgent('s1')
+  emit('session/event', session('s1'), compactStart)
+  emit('session/event', session('s1'), compactEnd)
+  await tick()
+  assert.equal(agent.calls.length, 1)
+  emit('session/event', session('s1'), userMessage('user'))
+  emit('session/event', session('s1'), compactStart)
+  emit('session/event', session('s1'), compactEnd)
+  await tick()
+  assert.equal(agent.calls.length, 2)
+}
+
+// A subagent compaction is skipped unless `includeSubagents` is on.
+{
+  const { emit, addAgent } = mount({ delayMs: 0, backoff: 1 })
+  const agent = addAgent('sub')
+  emit('session/event', session('sub', 'subagent'), compactStart)
+  emit('session/event', session('sub', 'subagent'), compactEnd)
+  await tick()
+  assert.equal(agent.calls.length, 0)
+}
+
+console.log('ok — turn-retry restarts failed turns and failed compactions within their budgets')

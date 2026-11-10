@@ -1,7 +1,7 @@
 {
   "name": "dsh-turn-retry",
-  "version": "0.1.0",
-  "description": "dsh plugin: restart a turn that ended with an error, with a configurable retry budget (default 10)",
+  "version": "0.2.0",
+  "description": "dsh plugin: restart a turn or a compaction that ended with an error, with a configurable retry budget (default 10)",
   "type": "module",
   "main": "./index.js",
   "exports": {
